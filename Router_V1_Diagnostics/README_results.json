@@ -1,0 +1,5 @@
+{
+  "purpose": "Diagnose Router v1; not tune Router v2",
+  "specificity_definition": "mean between-scenario normalised Spearman rank distance / mean within-scenario run-to-consensus distance",
+  "label_use": "No labels in internal metrics or ranking geometry. Ground truth enters only in the external evaluation columns."
+}
