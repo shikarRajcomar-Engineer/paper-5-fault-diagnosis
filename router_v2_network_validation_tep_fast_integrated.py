@@ -20,6 +20,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 EPS = 1e-12
 SENSORS = [f"xmeas_{i}" for i in range(1, 42)] + [f"xmv_{i}" for i in range(1, 12)]
 RUN_NAMES = ["simulationRun", "simulation_run", "simRun", "run", "run_id", "Run", "replicate"]
@@ -336,6 +341,178 @@ def surrogate_best(runs, source, target, shifts, cache, cfg):
     return float(best) if np.isfinite(best) else np.nan
 
 
+def _shift_source_runs(runs, source, shifts):
+    """Shift one source once per run/surrogate; reused for every target and lag."""
+    return [np.roll(run[:, source], int(shifts[i])) if int(shifts[i]) else run[:, source]
+            for i, run in enumerate(runs)]
+
+
+def _source_lags_from_shifted(shifted_runs, run_ids, lag):
+    blocks = []
+    for rid in run_ids:
+        values = shifted_runs[int(rid)]
+        n = len(values)
+        if n > lag + 2:
+            blocks.append(np.column_stack([values[lag-k:n-k] for k in range(1, lag + 1)]))
+    return np.vstack(blocks) if blocks else np.empty((0, lag), dtype=np.float64)
+
+
+def _torch_ridge_predict_rmse(target_train, target_test, source_train, source_test,
+                              y_train, y_test, ridge):
+    """Same ridge model as ridge_fit/ridge_predict, executed on GPU."""
+    n = target_train.shape[0]
+    ones = torch.ones((n, 1), device=target_train.device, dtype=target_train.dtype)
+    X = torch.cat((ones, target_train, source_train), dim=1)
+    XtX = X.T @ X
+    Xty = X.T @ y_train
+    penalty = torch.eye(XtX.shape[0], device=X.device, dtype=X.dtype) * ridge
+    penalty[0, 0] = 0.0
+    beta = torch.linalg.solve(XtX + penalty, Xty)
+    pred = beta[0] + torch.cat((target_test, source_test), dim=1) @ beta[1:]
+    return torch.sqrt(torch.mean((y_test - pred) ** 2))
+
+
+def build_gpu_target_cache(runs, target_indices, cfg, device):
+    """Build target-only cache directly onto GPU, one target/lag at a time."""
+    cut = max(1, min(len(runs) - 1, int(np.floor(len(runs) * (1.0 - cfg.test_fraction)))))
+    train_ids, test_ids = np.arange(cut), np.arange(cut, len(runs))
+    cache = {}
+    print(f"  precomputing target-only regressions on {device} ...", flush=True)
+    for target in sorted(set(map(int, target_indices))):
+        for lag in range(1, cfg.max_lag + 1):
+            ytr, xtr = target_design(runs, train_ids, target, lag)
+            yte, xte = target_design(runs, test_ids, target, lag)
+            if len(ytr) < max(40, 5 * lag) or len(yte) < 10:
+                continue
+            y_mean, y_std = ytr.mean(), ytr.std()
+            y_std = y_std if y_std >= EPS else 1.0
+            ytr = ((ytr - y_mean) / y_std).astype(np.float32, copy=False)
+            yte = ((yte - y_mean) / y_std).astype(np.float32, copy=False)
+            xtr, xte = standardise_train_test(xtr, xte)
+            xtr = xtr.astype(np.float32, copy=False); xte = xte.astype(np.float32, copy=False)
+            txtr = torch.from_numpy(xtr).to(device)
+            txte = torch.from_numpy(xte).to(device)
+            tytr = torch.from_numpy(ytr).to(device)
+            tyte = torch.from_numpy(yte).to(device)
+            # Baseline is target-only, matching the original null engine.
+            ones = torch.ones((txtr.shape[0], 1), device=device, dtype=torch.float32)
+            A = torch.cat((ones, txtr), dim=1)
+            gram = A.T @ A
+            penalty = torch.eye(gram.shape[0], device=device, dtype=torch.float32) * cfg.ridge
+            penalty[0, 0] = 0.0
+            beta = torch.linalg.solve(gram + penalty, A.T @ tytr)
+            pred = beta[0] + txte @ beta[1:]
+            baseline_rmse = float(torch.sqrt(torch.mean((tyte - pred) ** 2)).item())
+            cache[(target, lag)] = (tytr, tyte, txtr, txte, baseline_rmse, train_ids, test_ids)
+    return cache
+
+
+def fast_null_test_gpu(table, runs, cfg, checkpoint_dir=None):
+    """GPU null engine. Statistical design is unchanged; only computation is reorganised."""
+    candidate = table[
+        (table["improvement"] >= cfg.min_improvement)
+        & (table["split_stability"] >= cfg.min_stability)
+        & (table["directionality"] >= cfg.min_directionality)
+    ].copy()
+    print(f"GPU null-testing {len(candidate)} candidate edges with {cfg.surrogates} circular shifts; "
+          f"every surrogate scans lags 1..{cfg.max_lag} ...", flush=True)
+    if candidate.empty:
+        for col in ["null_p", "null_median", "null_q95", "null_max", "fdr_q"]:
+            candidate[col] = np.nan
+        candidate["retained"] = False
+        return candidate
+    if torch is None or not torch.cuda.is_available():
+        raise RuntimeError("GPU backend requested but CUDA/PyTorch GPU is unavailable.")
+    device = torch.device("cuda")
+    torch.set_grad_enabled(False)
+    cache = build_gpu_target_cache(runs, candidate["target_idx"].unique(), cfg, device)
+    groups = list(candidate.groupby("source_idx", sort=True))
+    null_values = {int(idx): np.full(cfg.surrogates, np.nan) for idx in candidate.index}
+    checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+    if checkpoint_dir:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    total_sources = len(groups)
+    for source_number, (source_idx, source_edges) in enumerate(groups, 1):
+        records = list(source_edges.itertuples())
+        cp = checkpoint_dir / f"source_{int(source_idx):02d}.npz" if checkpoint_dir else None
+        if cp is not None and cp.exists():
+            saved = np.load(cp)
+            for row in records:
+                key = f"edge_{int(row.Index)}"
+                if key in saved and len(saved[key]) == cfg.surrogates:
+                    null_values[int(row.Index)][:] = saved[key]
+            if all(np.isfinite(null_values[int(r.Index)]).all() for r in records):
+                print(f"  source progress: {source_number}/{total_sources} restored from checkpoint", flush=True)
+                continue
+        # Deterministic per-source RNG means resume does not alter the null draws.
+        rng = np.random.default_rng(cfg.random_seed + 1000003 * int(source_idx))
+        for surrogate_id in range(cfg.surrogates):
+            shifts = draw_shifts(runs, rng, cfg.max_lag)
+            # On resume, advance the deterministic RNG but skip already completed work.
+            if all(np.isfinite(null_values[int(r.Index)][surrogate_id]) for r in records):
+                continue
+            shifted = _shift_source_runs(runs, int(source_idx), shifts)
+            # Build/standardise source lags ONCE per lag, then reuse for every target edge.
+            lag_sources = {}
+            for lag in range(1, cfg.max_lag + 1):
+                # All cached targets use the same train/test run split.
+                any_fixed = next((v for (t, l), v in cache.items() if l == lag), None)
+                if any_fixed is None:
+                    continue
+                train_ids, test_ids = any_fixed[5], any_fixed[6]
+                strn = _source_lags_from_shifted(shifted, train_ids, lag)
+                ste = _source_lags_from_shifted(shifted, test_ids, lag)
+                strn, ste = standardise_train_test(strn, ste)
+                lag_sources[lag] = (
+                    torch.from_numpy(strn.astype(np.float32, copy=False)).to(device),
+                    torch.from_numpy(ste.astype(np.float32, copy=False)).to(device),
+                )
+            for row in records:
+                best = -np.inf
+                target = int(row.target_idx)
+                for lag, (source_train, source_test) in lag_sources.items():
+                    fixed = cache.get((target, lag))
+                    if fixed is None:
+                        continue
+                    ytr, yte, txtr, txte, baseline_rmse, _, _ = fixed
+                    if source_train.shape[0] != ytr.shape[0] or source_test.shape[0] != yte.shape[0]:
+                        continue
+                    rmse = _torch_ridge_predict_rmse(txtr, txte, source_train, source_test,
+                                                     ytr, yte, cfg.ridge)
+                    score = (baseline_rmse - float(rmse.item())) / max(baseline_rmse, EPS)
+                    if score > best:
+                        best = score
+                null_values[int(row.Index)][surrogate_id] = best if np.isfinite(best) else np.nan
+            if cp is not None and ((surrogate_id + 1) % 25 == 0 or surrogate_id + 1 == cfg.surrogates):
+                np.savez_compressed(cp, **{f"edge_{int(r.Index)}": null_values[int(r.Index)] for r in records})
+        if cp is not None:
+            np.savez_compressed(cp, **{f"edge_{int(r.Index)}": null_values[int(r.Index)] for r in records})
+        print(f"  source progress: {source_number}/{total_sources} "
+              f"({len(records)} edges x {cfg.surrogates} surrogates) [GPU]", flush=True)
+    return _finish_null(candidate, null_values, cfg)
+
+
+def _finish_null(candidate, null_values, cfg):
+    pvalues, medians, q95s, maxima = [], [], [], []
+    for idx, row in candidate.iterrows():
+        values = null_values[int(idx)]
+        values = values[np.isfinite(values)]
+        observed = float(row["improvement"])
+        if not len(values):
+            pvalues.append(np.nan); medians.append(np.nan); q95s.append(np.nan); maxima.append(np.nan)
+        else:
+            pvalues.append(float((1 + np.sum(values >= observed)) / (len(values) + 1)))
+            medians.append(float(np.median(values)))
+            q95s.append(float(np.quantile(values, 0.95)))
+            maxima.append(float(np.max(values)))
+    candidate["null_p"] = pvalues
+    candidate["null_median"] = medians
+    candidate["null_q95"] = q95s
+    candidate["null_max"] = maxima
+    candidate["fdr_q"] = bh_fdr(candidate["null_p"])
+    candidate["retained"] = candidate["fdr_q"] <= cfg.fdr_alpha
+    return candidate
+
 def bh_fdr(pvalues):
     output = pd.Series(np.nan, index=pvalues.index, dtype=float)
     valid = pvalues.dropna()
@@ -452,6 +629,9 @@ def parse_args():
     parser.add_argument("--fdr-alpha", type=float, default=0.05)
     parser.add_argument("--max-runs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--backend", choices=["auto", "cpu", "gpu"], default="auto")
+    parser.add_argument("--checkpoint-dir", default=None)
+    parser.add_argument("--reuse-screening", action="store_true", help="Reuse all_ordered_edges_screening.csv if present")
     return parser.parse_args()
 
 
@@ -474,8 +654,25 @@ def main():
         f"Run lengths min/median/max: {meta['run_lengths_min']} / {meta['run_lengths_median']:.0f} / {meta['run_lengths_max']}\n"
         f"Sensors: {len(sensors)} ({sensors[0]} ... {sensors[-1]})\n"
     )
-    table = pair_table(runs, sensors, cfg)
-    candidate = fast_null_test(table, runs, cfg)
+    output_dir = Path(args.out)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    screening_file = output_dir / "all_ordered_edges_screening.csv"
+    if args.reuse_screening and screening_file.exists():
+        print(f"Reusing screening table: {screening_file}", flush=True)
+        table = pd.read_csv(screening_file)
+    else:
+        table = pair_table(runs, sensors, cfg)
+        table.to_csv(screening_file, index=False)
+        print(f"Screening checkpoint written: {screening_file}", flush=True)
+    backend = args.backend
+    if backend == "auto":
+        backend = "gpu" if torch is not None and torch.cuda.is_available() else "cpu"
+    print(f"Null-test backend: {backend.upper()}", flush=True)
+    checkpoint_dir = args.checkpoint_dir or str(output_dir / "null_checkpoints")
+    if backend == "gpu":
+        candidate = fast_null_test_gpu(table, runs, cfg, checkpoint_dir=checkpoint_dir)
+    else:
+        candidate = fast_null_test(table, runs, cfg)
     merge_columns = ["source", "target", "null_p", "null_median", "null_q95", "null_max", "fdr_q", "retained"]
     table = table.merge(candidate[merge_columns], on=["source", "target"], how="left")
     table["retained"] = table["retained"].fillna(False).astype(bool)
