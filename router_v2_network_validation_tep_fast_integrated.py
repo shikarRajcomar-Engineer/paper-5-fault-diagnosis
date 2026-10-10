@@ -526,14 +526,22 @@ def bh_fdr(pvalues):
     return output
 
 
-def fast_null_test(table, runs, cfg):
+def fast_null_test(table, runs, cfg, checkpoint_dir=None):
+    """Optimised CPU null engine.
+
+    Statistical test is unchanged: for every candidate edge and every circular-shift
+    surrogate, scan lags 1..max_lag and retain the best improvement.  The speedup
+    comes from shifting/building/standardising a source only once per source,
+    surrogate and lag, then reusing it across all candidate targets from that source.
+    Results are checkpointed per source so interrupted Colab sessions can resume.
+    """
     candidate = table[
         (table["improvement"] >= cfg.min_improvement)
         & (table["split_stability"] >= cfg.min_stability)
         & (table["directionality"] >= cfg.min_directionality)
     ].copy()
     print(
-        f"Fast null-testing {len(candidate)} candidate edges with {cfg.surrogates} circular shifts; "
+        f"Optimised CPU null-testing {len(candidate)} candidate edges with {cfg.surrogates} circular shifts; "
         f"every surrogate scans lags 1..{cfg.max_lag} ...", flush=True,
     )
     if candidate.empty:
@@ -541,42 +549,86 @@ def fast_null_test(table, runs, cfg):
             candidate[col] = np.nan
         candidate["retained"] = False
         return candidate
+
     cache = build_target_cache(runs, candidate["target_idx"].unique(), cfg)
-    rng = np.random.default_rng(cfg.random_seed)
-    null_values = {int(idx): np.full(cfg.surrogates, np.nan) for idx in candidate.index}
     groups = list(candidate.groupby("source_idx", sort=True))
+    null_values = {int(idx): np.full(cfg.surrogates, np.nan) for idx in candidate.index}
+
+    checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+    if checkpoint_dir:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     total_sources = len(groups)
     for source_number, (source_idx, source_edges) in enumerate(groups, 1):
+        source_idx = int(source_idx)
         records = list(source_edges.itertuples())
+        cp = checkpoint_dir / f"source_{source_idx:02d}.npz" if checkpoint_dir else None
+
+        # Restore any completed work for this source.
+        if cp is not None and cp.exists():
+            with np.load(cp) as saved:
+                for row in records:
+                    key = f"edge_{int(row.Index)}"
+                    if key in saved and len(saved[key]) == cfg.surrogates:
+                        null_values[int(row.Index)][:] = saved[key]
+            if all(np.isfinite(null_values[int(r.Index)]).all() for r in records):
+                print(f"  source progress: {source_number}/{total_sources} restored from checkpoint", flush=True)
+                continue
+
+        # Deterministic RNG per source: worker/order independent and safe to resume.
+        rng = np.random.default_rng(cfg.random_seed + 1000003 * source_idx)
+
         for surrogate_id in range(cfg.surrogates):
             shifts = draw_shifts(runs, rng, cfg.max_lag)
+            if all(np.isfinite(null_values[int(r.Index)][surrogate_id]) for r in records):
+                continue
+
+            # Expensive source work is done ONCE here, not once per target edge.
+            shifted = _shift_source_runs(runs, source_idx, shifts)
+            lag_sources = {}
+            for lag in range(1, cfg.max_lag + 1):
+                any_fixed = next((v for (t, l), v in cache.items() if l == lag), None)
+                if any_fixed is None:
+                    continue
+                train_ids, test_ids = any_fixed.train_run_ids, any_fixed.test_run_ids
+                source_train = _source_lags_from_shifted(shifted, train_ids, lag)
+                source_test = _source_lags_from_shifted(shifted, test_ids, lag)
+                source_train, source_test = standardise_train_test(source_train, source_test)
+                lag_sources[lag] = (source_train, source_test)
+
             for row in records:
-                null_values[int(row.Index)][surrogate_id] = surrogate_best(
-                    runs, int(source_idx), int(row.target_idx), shifts, cache, cfg
-                )
+                target = int(row.target_idx)
+                best = -np.inf
+                for lag, (source_train, source_test) in lag_sources.items():
+                    fixed = cache.get((target, lag))
+                    if fixed is None:
+                        continue
+                    if len(source_train) != len(fixed.train_y) or len(source_test) != len(fixed.test_y):
+                        continue
+                    train_x = np.concatenate((fixed.train_target, source_train), axis=1)
+                    test_x = np.concatenate((fixed.test_target, source_test), axis=1)
+                    beta = ridge_fit(train_x, fixed.train_y, cfg.ridge)
+                    pred = ridge_predict(test_x, beta)
+                    extended_rmse = float(np.sqrt(np.mean((fixed.test_y - pred) ** 2)))
+                    score = (fixed.baseline_rmse - extended_rmse) / max(fixed.baseline_rmse, EPS)
+                    if score > best:
+                        best = score
+                null_values[int(row.Index)][surrogate_id] = best if np.isfinite(best) else np.nan
+
+            # Small checkpoint every 5 surrogates; useful even for short Colab sessions.
+            if cp is not None and ((surrogate_id + 1) % 5 == 0 or surrogate_id + 1 == cfg.surrogates):
+                tmp = cp.with_suffix('.tmp.npz')
+                np.savez_compressed(tmp, **{
+                    f"edge_{int(r.Index)}": null_values[int(r.Index)] for r in records
+                })
+                tmp.replace(cp)
+
         print(
             f"  source progress: {source_number}/{total_sources} "
-            f"({len(records)} edges x {cfg.surrogates} surrogates)", flush=True,
+            f"({len(records)} edges x {cfg.surrogates} surrogates) [OPT-CPU]", flush=True,
         )
-    pvalues, medians, q95s, maxima = [], [], [], []
-    for idx, row in candidate.iterrows():
-        values = null_values[int(idx)]
-        values = values[np.isfinite(values)]
-        observed = float(row["improvement"])
-        if not len(values):
-            pvalues.append(np.nan); medians.append(np.nan); q95s.append(np.nan); maxima.append(np.nan)
-        else:
-            pvalues.append(float((1 + np.sum(values >= observed)) / (len(values) + 1)))
-            medians.append(float(np.median(values)))
-            q95s.append(float(np.quantile(values, 0.95)))
-            maxima.append(float(np.max(values)))
-    candidate["null_p"] = pvalues
-    candidate["null_median"] = medians
-    candidate["null_q95"] = q95s
-    candidate["null_max"] = maxima
-    candidate["fdr_q"] = bh_fdr(candidate["null_p"])
-    candidate["retained"] = candidate["fdr_q"] <= cfg.fdr_alpha
-    return candidate
+
+    return _finish_null(candidate, null_values, cfg)
 
 
 def write_outputs(table, candidate, retained, sensors, cfg, meta, output_dir):
@@ -672,7 +724,7 @@ def main():
     if backend == "gpu":
         candidate = fast_null_test_gpu(table, runs, cfg, checkpoint_dir=checkpoint_dir)
     else:
-        candidate = fast_null_test(table, runs, cfg)
+        candidate = fast_null_test(table, runs, cfg, checkpoint_dir=checkpoint_dir)
     merge_columns = ["source", "target", "null_p", "null_median", "null_q95", "null_max", "fdr_q", "retained"]
     table = table.merge(candidate[merge_columns], on=["source", "target"], how="left")
     table["retained"] = table["retained"].fillna(False).astype(bool)
