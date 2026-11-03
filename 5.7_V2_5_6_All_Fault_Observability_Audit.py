@@ -94,3 +94,6 @@ def main():
     normal_err = pd.read_parquet(NORMAL_FILE, columns=SENSORS)
     normal_ids = pd.read_parquet(RAW_NORMAL_FILE, columns=['simulationRun','sample'])
     assert len(normal_err) == len(normal_ids) == 250000
+
+if __name__ == "__main__":
+    main()
