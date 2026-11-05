@@ -110,9 +110,16 @@ def main():
     if old_thresh.is_file():
         old = pd.read_csv(old_thresh).set_index("sensor")["threshold"]
         delta = max(abs(thresholds[s] - float(old.loc[s])) for s in SENSORS)
-        if delta > 1e-10:
+        # CSV serialization can round q99 values by a few float32 ULPs.
+        # This is a verification tolerance ONLY; the q99 thresholds used
+        # by the frozen ranking function are never modified or rounded here.
+        if not np.isfinite(delta) or delta > 1e-6:
             raise RuntimeError(f"Frozen training threshold mismatch: {delta}")
-        print(f"Original saved thresholds match: max delta={delta:.3e}", flush=True)
+        print(
+            f"Original saved thresholds match within CSV precision: "
+            f"max delta={delta:.3e}, tolerance=1.0e-6",
+            flush=True,
+        )
     threshold_df.to_csv(thresh_path, index=False)
     print("Ground-truth labels are NOT used in the ranking stage.", flush=True)
 
