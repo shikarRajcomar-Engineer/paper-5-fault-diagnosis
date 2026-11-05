@@ -33,8 +33,21 @@ def main():
     p=argparse.ArgumentParser(description="Inspect MATLAB testing data variables without conversion")
     p.add_argument("--dir",default="/content/drive/MyDrive/Paper 5",help="Drive folder containing testing .mat file")
     p.add_argument("--filename",default=None,help="Exact .mat filename if multiple candidates exist")
+    p.add_argument("--path",default=None,help="Exact full path to one MAT file (avoids same-named files)")
     args=p.parse_args()
     folder=Path(args.dir)
+    if args.path:
+        mat=Path(args.path)
+        if not mat.is_file() or mat.suffix.lower() != ".mat":
+            raise FileNotFoundError(f"Not a readable .mat file: {mat}")
+        print(f"INSPECTING EXACT FILE: {mat}",flush=True)
+        try:
+            _describe_scipy(mat)
+        except (NotImplementedError,ValueError,TypeError) as err:
+            print(f"scipy cannot read layout: {err}; trying h5py",flush=True)
+            _describe_h5(mat)
+        print("\\nNo parquet files created.",flush=True)
+        return
     if not folder.is_dir():
         raise FileNotFoundError(f"Drive folder unavailable: {folder} (check mount or --dir)")
     files=sorted(x for x in folder.rglob("*") if x.is_file() and x.suffix.lower()==".mat")
