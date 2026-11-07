@@ -288,9 +288,15 @@ def main():
                 "confirmation_sample": ans["episode_confirmation_sample"],
             })
         pd.DataFrame(healthy).to_csv(out/"normal_run_episode_metrics.csv",index=False)
-        print("Normal validation false-alarm rate: "
-              f"{100*pd.DataFrame(healthy).query('calibration_or_validation == \"normal_validation\"').episode_detected.mean():.2f}%",
-              flush=True)
+        healthy_df = pd.DataFrame(healthy)
+        validation = healthy_df.loc[
+            healthy_df["calibration_or_validation"] == "normal_validation"
+        ]
+        print(
+            "Normal validation false-alarm rate: "
+            f"{100 * validation['episode_detected'].mean():.2f}%",
+            flush=True,
+        )
 
     import pyarrow.dataset as ds
     dataset = ds.dataset(str(args.train_cache),format="parquet") if args.split=="train" else None
