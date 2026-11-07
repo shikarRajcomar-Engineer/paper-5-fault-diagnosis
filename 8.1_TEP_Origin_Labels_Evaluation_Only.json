@@ -1,0 +1,21 @@
+{
+  "dataset": "TEP",
+  "purpose": "evaluation_only_not_used_by_inference",
+  "true_causes": {
+    "1": "xmeas_4",
+    "2": "xmeas_4",
+    "3": "xmeas_23",
+    "4": "xmv_10",
+    "5": "xmeas_22",
+    "6": "xmv_3",
+    "7": "xmeas_4",
+    "8": "xmeas_4",
+    "9": "xmeas_23",
+    "10": "xmeas_4",
+    "11": "xmv_10",
+    "12": "xmv_11",
+    "13": "xmeas_9",
+    "14": "xmv_10",
+    "15": "xmv_11"
+  }
+}
